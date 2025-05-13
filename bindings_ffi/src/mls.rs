@@ -3053,7 +3053,7 @@ mod tests {
             ident,
             nonce,
             None,
-            history_sync_url,
+            None,
             sync_worker_mode,
         )
         .await
@@ -8092,7 +8092,7 @@ mod tests {
             )
             .await
             .unwrap();
-        replace.add(&hex::encode(&alix_group.inner.group_id), "alix_group1");
+        replace.add(&hex::encode(&alix_group.inner.group_id), "alix_group");
 
         let caro_group2 = caro
             .conversations()
@@ -8123,9 +8123,16 @@ mod tests {
 
         // Get conversation references for each client
         let bo_group = bo.conversation(alix_group.id()).unwrap();
+        replace.add(&hex::encode(&bo_group.inner.group_id), "bo_group_alix");
         let caro_group = caro.conversation(alix_group.id()).unwrap();
+        replace.add(&hex::encode(&caro_group.inner.group_id), "caro_group_alix");
         let bo_group2 = bo.conversation(caro_group2.id()).unwrap();
+        replace.add(&hex::encode(&caro_group2.inner.group_id), "bo_group_caro");
         let alix_group2 = alix.conversation(caro_group2.id()).unwrap();
+        replace.add(
+            &hex::encode(&caro_group2.inner.group_id),
+            "alix_group_caro2",
+        );
 
         // Create a callback to track messages received by Caro
         let messages = Arc::new(Mutex::new(Vec::new()));
@@ -8217,6 +8224,10 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                    replace.add(
+                        &hex::encode(&group.inner.group_id),
+                        &format!("davon_group_{}", i),
+                    );
                     group.send(spam_message.as_bytes().to_vec()).await.unwrap();
                     log::info!("Davon spam: {}", spam_message);
                 }
@@ -8241,7 +8252,7 @@ mod tests {
         join_all(vec![alix_task, bo_task, davon_task, caro_task]).await;
 
         // Wait a bit to ensure all messages are processed
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Stop the stream
         stream.end_and_wait().await.unwrap();
