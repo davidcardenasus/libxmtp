@@ -12,6 +12,7 @@ use super::{
 use crate::configuration::sync_update_installations_interval_ns;
 use crate::groups::device_sync_legacy::preference_sync_legacy::process_incoming_preference_update;
 use crate::subscriptions::SyncWorkerEvent;
+use crate::verified_key_package_v2::{KeyPackageVerificationError, VerifiedKeyPackageV2};
 use crate::{
     client::ClientError, groups::group_mutable_metadata::MetadataField,
     subscriptions::stream_messages::extract_message_cursor,
@@ -34,10 +35,6 @@ use crate::{
 use crate::{
     groups::group_membership::{GroupMembership, MembershipDiffWithKeyPackages},
     utils::id::calculate_message_id_for_intent,
-};
-use crate::{
-    groups::summary::MessageSource,
-    verified_key_package_v2::{KeyPackageVerificationError, VerifiedKeyPackageV2},
 };
 use xmtp_db::{
     group::{ConversationType, StoredGroup},
@@ -101,8 +98,10 @@ use xmtp_proto::xmtp::mls::{
 
 #[derive(Debug, Error)]
 pub enum GroupMessageProcessingError {
-    #[error("[{0}] already processed")]
-    AlreadyProcessed(u64),
+    #[error("message with cursor [{}] for group [{}] already processed", _0.cursor, xmtp_common::fmt::debug_hex(&_0.group_id))]
+    MessageAlreadyProcessed(MessageIdentifier),
+    #[error("welcome with cursor [{0}] already processed")]
+    WelcomeAlreadyProcessed(u64),
     #[error("[{message_time_ns:?}] invalid sender with credential: {credential:?}")]
     InvalidSender {
         message_time_ns: u64,
@@ -150,9 +149,9 @@ pub enum GroupMessageProcessingError {
     Client(#[from] ClientError),
     #[error("Group paused due to minimum protocol version requirement")]
     GroupPaused,
-    #[error("Message epoch is too old")]
+    #[error("Message epoch [{0}] is too old [{1}]")]
     OldEpoch(u64, u64),
-    #[error("Message epoch is greater than group epoch")]
+    #[error("Message epoch [{0}] is greater than group epoch [{1}]")]
     FutureEpoch(u64, u64),
     #[error(transparent)]
     Db(#[from] xmtp_db::ConnectionError),
@@ -172,7 +171,8 @@ impl RetryableError for GroupMessageProcessingError {
             Self::Db(e) => e.is_retryable(),
             Self::WrongCredentialType(_)
             | Self::Codec(_)
-            | Self::AlreadyProcessed(_)
+            | Self::MessageAlreadyProcessed(_)
+            | Self::WelcomeAlreadyProcessed(_)
             | Self::InvalidSender { .. }
             | Self::DecodeProto(_)
             | Self::InvalidPayload
@@ -611,7 +611,7 @@ where
         message: PrivateMessageIn,
         envelope: &GroupMessageV1,
         allow_cursor_increment: bool,
-    ) -> Result<Option<MessageIdentifier>, GroupMessageProcessingError> {
+    ) -> Result<MessageIdentifier, GroupMessageProcessingError> {
         #[cfg(any(test, feature = "test-utils"))]
         {
             use crate::utils::maybe_mock_wrong_epoch_for_tests;
@@ -711,7 +711,10 @@ where
                 current_cursor < *cursor as i64
             };
             if !requires_processing {
-                return Err(ProcessIntentError::AlreadyProcessed(*cursor).into());
+                // early return if the message is already procesed
+                // _NOTE_: Not early returning and re-processing a message that
+                // has already been processed, has the potential to result in forks.
+                return Ok(envelope.into());
             }
             let previous_epoch = mls_group.epoch().as_u64();
 
@@ -749,7 +752,7 @@ where
         processed_message: ProcessedMessage,
         envelope: &GroupMessageV1,
         validated_commit: Option<ValidatedCommit>,
-    ) -> Result<Option<MessageIdentifier>, GroupMessageProcessingError> {
+    ) -> Result<MessageIdentifier, GroupMessageProcessingError> {
         let GroupMessageV1 {
             created_ns: envelope_timestamp_ns,
             id: ref cursor,
@@ -975,9 +978,10 @@ where
                 Ok(msg)
             }
         };
-        let processed_message = processed_message?
-            .map(|m| MessageIdentifier::new(*cursor, m.id, MessageSource::External));
-        Ok(processed_message)
+        Ok(MessageIdentifier::new(
+            envelope,
+            processed_message?.map(|m| m.id),
+        ))
     }
 
     /// This function is idempotent. No need to wrap in a transaction.
@@ -992,7 +996,7 @@ where
         &self,
         envelope: &GroupMessageV1,
         trust_message_order: bool,
-    ) -> Result<Option<MessageIdentifier>, GroupMessageProcessingError> {
+    ) -> Result<MessageIdentifier, GroupMessageProcessingError> {
         let provider = self.mls_provider();
         let allow_epoch_increment = trust_message_order;
         let allow_cursor_increment = trust_message_order;
@@ -1074,7 +1078,10 @@ where
                             current_cursor < cursor as i64
                         };
                         if !requires_processing {
-                            return Err(GroupMessageProcessingError::ProcessIntent(ProcessIntentError::AlreadyProcessed(cursor)));
+                            // early return if the message is already procesed
+                            // _NOTE_: Not early returning and re-processing a message that
+                            // has already been processed, has the potential to result in forks.
+                            return Ok(envelope.into());
                         }
                         let (intent_state, internal_message_id) = match maybe_validated_commit {
                             // the error is also a Result
@@ -1109,9 +1116,7 @@ where
                                 provider.db().set_group_intent_processed(intent_id)?;
                             }
                         }
-                        Ok(internal_message_id.map(|i| {
-                            MessageIdentifier::new(cursor, i, MessageSource::Own(intent_state))
-                        }))
+                        Ok(MessageIdentifier::new(envelope, internal_message_id))
                     })
                 }).await?;
 
@@ -1212,7 +1217,7 @@ where
     async fn consume_message(
         &self,
         envelope: &GroupMessage,
-    ) -> Result<Option<MessageIdentifier>, GroupMessageProcessingError> {
+    ) -> Result<MessageIdentifier, GroupMessageProcessingError> {
         let provider = self.mls_provider();
         let msgv1 = match &envelope.version {
             Some(GroupMessageVersion::V1(value)) => value,
@@ -1239,7 +1244,10 @@ where
                 message_entity_kind,
                 last_cursor
             );
-            return Err(GroupMessageProcessingError::AlreadyProcessed(msgv1.id));
+            // early return if the message is already procesed
+            // _NOTE_: Not early returning and re-processing a message that
+            // has already been processed, has the potential to result in forks.
+            return Ok(msgv1.into());
         }
 
         // Download all unread welcome messages and convert to groups.Run `man nix.conf` for more information on the `substituters` configuration option.
@@ -1301,11 +1309,7 @@ where
                 (async { self.consume_message(&message).await })
             );
             match result {
-                Ok(m) => {
-                    if let Some(m) = m {
-                        summary.add(m)
-                    }
-                }
+                Ok(m) => summary.add(m),
                 Err(GroupMessageProcessingError::GroupPaused) => {
                     tracing::info!(
                         "Group [{}] is paused, skip syncing remaining messages",
@@ -1338,7 +1342,6 @@ where
     /// if they were succesfull or not. It is important to return _all_
     /// cursor ids, so that streams do not unintentially retry O(n^2) messages.
     #[tracing::instrument(skip_all, level = "debug")]
-
     pub(super) async fn receive(&self) -> Result<ProcessSummary, GroupError> {
         let provider = self.mls_provider();
         let messages = self

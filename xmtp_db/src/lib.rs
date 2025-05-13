@@ -45,12 +45,6 @@ pub async fn init_sqlite() {}
 pub mod test_util {
     #![allow(clippy::unwrap_used)]
 
-    #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
-    #[cfg(not(target_arch = "wasm32"))]
-    fn _setup() {
-        xmtp_common::logger();
-    }
-
     use super::*;
     use diesel::{RunQueryDsl, connection::LoadConnection, deserialize::FromSqlRow, sql_query};
     impl<C: ConnectionExt> DbConnection<C> {

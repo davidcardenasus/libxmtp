@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use xmtp_common::RetryableError;
-use xmtp_db::group_intent::IntentState;
+use xmtp_proto::mls_v1::group_message;
 
 use super::{mls_sync::GroupMessageProcessingError, GroupError};
 
@@ -25,7 +25,18 @@ impl RetryableError for SyncSummary {
                 .unwrap_or(false)
     }
 }
+
 impl SyncSummary {
+    /// synced a single message succesfully
+    pub fn single(msg: MessageIdentifier) -> Self {
+        let mut process = ProcessSummary::default();
+        process.add(msg);
+        SyncSummary {
+            process,
+            ..Default::default()
+        }
+    }
+
     pub fn is_errored(&self) -> bool {
         self.other.is_some()
             || (!self.publish_errors.is_empty() && !self.post_commit_errors.is_empty())
@@ -81,14 +92,27 @@ impl std::fmt::Debug for SyncSummary {
 
 impl std::fmt::Display for SyncSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.publish_errors.is_empty() && self.post_commit_errors.is_empty() {
+        if self.publish_errors.is_empty()
+            && self.post_commit_errors.is_empty()
+            && self.other.is_none()
+        {
+            let first_new = self
+                .process
+                .new_messages
+                .iter()
+                .min_by_key(|k| k.cursor)
+                .map(|m| m.cursor);
             write!(
                 f,
-                "synced {} messages, {} failed {} succeeded",
+                "synced {} messages, {} failed {} succeeded from cursor {:?}",
                 self.process.total_messages.len(),
                 self.process.errored.len(),
-                self.process.new_messages.len()
+                self.process.new_messages.len(),
+                first_new
             )?;
+            if !self.process.errored.is_empty() {
+                write!(f, "{}", self.process.unique_errors())?;
+            }
         } else {
             writeln!(
                 f,
@@ -113,25 +137,36 @@ impl std::fmt::Display for SyncSummary {
     }
 }
 
-/// The originating source of a message.
-/// It either originated from us (in which case has an associated IntentState)
-/// or it is an external message.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum MessageSource {
-    /// Only own published messages
-    Own(IntentState),
-    /// External Messages
-    External,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MessageIdentifier {
     /// the cursor of the message as it exists on the network
     pub cursor: u64,
-    /// The generated ID of the message as it exists in the database
-    id: Vec<u8>,
-    /// The source of the message
-    source: MessageSource,
+    pub group_id: Vec<u8>,
+    pub created_ns: u64,
+    /// the id of the message in the local database
+    pub internal_id: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for MessageIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageIdentifier")
+            .field("cursor", &self.cursor)
+            .field("group_id", &xmtp_common::fmt::debug_hex(&self.group_id))
+            .field("created_ns", &self.created_ns)
+            .field("internal_id", &self.internal_id)
+            .finish()
+    }
+}
+
+impl From<&group_message::V1> for MessageIdentifier {
+    fn from(value: &group_message::V1) -> Self {
+        MessageIdentifier {
+            cursor: value.id,
+            group_id: value.group_id.clone(),
+            created_ns: value.created_ns,
+            internal_id: None,
+        }
+    }
 }
 
 impl PartialOrd for MessageIdentifier {
@@ -141,8 +176,13 @@ impl PartialOrd for MessageIdentifier {
 }
 
 impl MessageIdentifier {
-    pub fn new(cursor: u64, id: Vec<u8>, source: MessageSource) -> Self {
-        Self { cursor, id, source }
+    pub fn new(envelope: &group_message::V1, internal_id: Option<Vec<u8>>) -> Self {
+        Self {
+            cursor: envelope.id,
+            group_id: envelope.group_id.clone(),
+            created_ns: envelope.created_ns,
+            internal_id,
+        }
     }
 }
 
@@ -150,7 +190,7 @@ impl MessageIdentifier {
 /// And which messages could not be synced.
 #[derive(Default)]
 pub struct ProcessSummary {
-    pub total_messages: Vec<u64>,
+    pub total_messages: HashSet<u64>,
     pub new_messages: Vec<MessageIdentifier>,
     pub errored: Vec<(u64, GroupMessageProcessingError)>,
 }
@@ -161,17 +201,77 @@ impl std::fmt::Debug for ProcessSummary {
     }
 }
 
+pub struct ErrorSet {
+    // Hashmap of message ids and the error they failed with
+    unique: HashMap<String, Vec<u64>>,
+    /// sorted vector of all failed ids
+    sorted_ids: Vec<(u64, String)>,
+}
+
+impl std::fmt::Display for ErrorSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (error_msg, ids) in &self.unique {
+            let mut sorted_ids = ids.clone();
+            sorted_ids.sort();
+            write!(f, "\n\t┝━> {:?} {error_msg}", ids)?;
+        }
+        Ok(())
+    }
+}
+
+impl ErrorSet {
+    pub fn unique(&self) -> &HashMap<String, Vec<u64>> {
+        &self.unique
+    }
+
+    pub fn sorted(&self) -> &[(u64, String)] {
+        &self.sorted_ids
+    }
+}
+
 impl ProcessSummary {
     pub fn add_id(&mut self, id: u64) {
-        self.total_messages.push(id);
+        self.total_messages.insert(id);
     }
 
     pub fn add(&mut self, message: MessageIdentifier) {
+        self.total_messages.insert(message.cursor);
         self.new_messages.push(message);
+    }
+
+    /// the last message procesed
+    pub fn last(&self) -> Option<u64> {
+        let mut v = self.total_messages.iter().copied().collect::<Vec<_>>();
+        v.sort();
+        v.last().copied()
+    }
+
+    /// the first messages processed
+    pub fn first(&self) -> Option<u64> {
+        let mut v = self.total_messages.iter().copied().collect::<Vec<_>>();
+        v.sort();
+        v.first().copied()
     }
 
     pub fn errored(&mut self, message_id: u64, error: GroupMessageProcessingError) {
         self.errored.push((message_id, error));
+    }
+
+    pub fn unique_errors(&self) -> ErrorSet {
+        let mut sorted = self
+            .errored
+            .iter()
+            .map(|(m, e)| (*m, e.to_string()))
+            .collect::<Vec<(_, String)>>();
+        sorted.sort_by_key(|(m, _)| *m);
+        let mut error_set: HashMap<String, Vec<u64>> = HashMap::new();
+        for (id, err) in sorted.iter().cloned() {
+            error_set.entry(err).or_default().push(id);
+        }
+        ErrorSet {
+            unique: error_set,
+            sorted_ids: sorted,
+        }
     }
 
     pub fn extend(&mut self, other: ProcessSummary) {
@@ -186,16 +286,7 @@ impl ProcessSummary {
 
     /// detailed printout of the messages processed
     fn detailed(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut sorted = self
-            .errored
-            .iter()
-            .map(|(m, e)| (m, e.to_string()))
-            .collect::<Vec<(_, String)>>();
-        sorted.sort_by_key(|(m, _)| **m);
-        let mut error_set: HashMap<String, Vec<u64>> = HashMap::new();
-        for (id, err) in sorted.iter().cloned() {
-            error_set.entry(err).or_default().push(*id);
-        }
+        let error_set = self.unique_errors();
         writeln!(
             f,
             "\n=========================== Processed Messages Summary  ====================="
@@ -204,11 +295,11 @@ impl ProcessSummary {
             f,
             "Processed {} total messages in cursor range [{:?} ... {:?}]",
             self.total_messages.len(),
-            sorted.first().map(|(m, _)| m),
-            sorted.last().map(|(m, _)| m)
+            error_set.sorted_ids.first().map(|(m, _)| m),
+            error_set.sorted_ids.last().map(|(m, _)| m)
         )?;
         if !self.errored.is_empty() {
-            let error_ids = error_set.values().flatten();
+            let error_ids = error_set.unique.values().flatten();
             let min = error_ids.clone().min();
             let max = error_ids.clone().max();
 
@@ -219,9 +310,9 @@ impl ProcessSummary {
                 self.errored.len(),
                 min,
                 max,
-                error_set.len(),
+                error_set.unique.len(),
             )?;
-            for (err, ids) in error_set.iter() {
+            for (err, ids) in error_set.unique.iter() {
                 writeln!(f, "{} ids errored with [{}]", ids.len(), err)?;
             }
         } else {

@@ -1,6 +1,6 @@
 use crate::identity::{FfiCollectionExt, FfiCollectionTryExt, FfiIdentifier};
 pub use crate::inbox_owner::SigningError;
-use crate::logger::init_logger;
+// use crate::logger::init_logger;
 use crate::worker::FfiSyncWorker;
 use crate::worker::FfiSyncWorkerMode;
 use crate::{FfiSubscribeError, GenericError};
@@ -86,7 +86,7 @@ pub async fn connect_to_backend(
     host: String,
     is_secure: bool,
 ) -> Result<Arc<XmtpApiClient>, GenericError> {
-    init_logger();
+    // init_logger();
 
     log::info!(
         host,
@@ -136,7 +136,7 @@ pub async fn create_client(
     device_sync_mode: Option<FfiSyncWorkerMode>,
 ) -> Result<Arc<FfiXmtpClient>, GenericError> {
     let ident = account_identifier.clone();
-    init_logger();
+    // init_logger();
 
     log::info!(
         "Creating message store with path: {:?} and encryption key: {} of length {:?}",
@@ -207,7 +207,7 @@ pub async fn get_inbox_id_for_identifier(
     api: Arc<XmtpApiClient>,
     account_identifier: FfiIdentifier,
 ) -> Result<Option<String>, GenericError> {
-    init_logger();
+    // init_logger();
     let mut api =
         ApiClientWrapper::new(Arc::new(api.0.clone()), strategies::exponential_cooldown());
     let account_identifier: Identifier = account_identifier.try_into()?;
@@ -2813,8 +2813,8 @@ mod tests {
         time::Duration,
     };
     use tokio::{sync::Notify, time::error::Elapsed};
-    use xmtp_common::tmp_path;
     use xmtp_common::{time::now_ns, wait_for_ge};
+    use xmtp_common::{tmp_path, TestLogReplace};
     use xmtp_common::{wait_for_eq, wait_for_ok};
     use xmtp_content_types::{
         attachment::AttachmentCodec, bytes_to_encoded_content, encoded_content_to_bytes,
@@ -8053,14 +8053,31 @@ mod tests {
         // Clean up the stream
         stream.end_and_wait().await.unwrap();
     }
-    
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_streams_and_parallel_messages() {
+        let alix = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
+        let bo = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
+        let caro = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
+        let davon = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
+        let mut replace = TestLogReplace::default();
+        replace.add(&alix.get_identifier().unwrap().to_string(), "alix_addr");
+        replace.add(&bo.get_identifier().unwrap().to_string(), "bo_addr");
+        replace.add(&caro.get_identifier().unwrap().to_string(), "caro_addr");
+        replace.add(&davon.get_identifier().unwrap().to_string(), "davon_addr");
         // Create four test clients
-        let alix = new_test_client().await;
-        let bo = new_test_client().await;
-        let caro = new_test_client().await;
-        let davon = new_test_client().await;
+        let alix = new_test_client_with_wallet(alix).await;
+        let bo = new_test_client_with_wallet(bo).await;
+        let caro = new_test_client_with_wallet(caro).await;
+        let davon = new_test_client_with_wallet(davon).await;
+        replace.add(&alix.inbox_id(), "alix");
+        replace.add(&bo.inbox_id(), "bo");
+        replace.add(&caro.inbox_id(), "caro");
+        replace.add(&davon.inbox_id(), "davon");
+        replace.add(&hex::encode(alix.installation_id()), "alix_installation");
+        replace.add(&hex::encode(bo.installation_id()), "bo_installation");
+        replace.add(&hex::encode(caro.installation_id()), "caro_installation");
+        replace.add(&hex::encode(davon.installation_id()), "davon_installation");
 
         // Create two groups, each with all three clients
         // Group 1 created by Alix, Group 2 by Caro
@@ -8075,6 +8092,7 @@ mod tests {
             )
             .await
             .unwrap();
+        replace.add(&hex::encode(&alix_group.inner.group_id), "alix_group1");
 
         let caro_group2 = caro
             .conversations()
@@ -8087,6 +8105,7 @@ mod tests {
             )
             .await
             .unwrap();
+        replace.add(&hex::encode(&caro_group2.inner.group_id), "caro_group2");
 
         // All three clients sync all conversations
         alix.conversations()
@@ -8151,7 +8170,7 @@ mod tests {
         stream.wait_for_ready().await;
 
         // Wait a bit to ensure streaming is set up
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Create several tasks to send messages in parallel
 
@@ -8222,7 +8241,7 @@ mod tests {
         join_all(vec![alix_task, bo_task, davon_task, caro_task]).await;
 
         // Wait a bit to ensure all messages are processed
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Stop the stream
         stream.end_and_wait().await.unwrap();

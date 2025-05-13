@@ -125,6 +125,22 @@ pub fn logger() {
     });
 }
 
+/*
+// Execute once before any tests are run
+#[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "test-utils"))]
+fn ctor_logging_setup() {
+    crate::logger();
+    let _ = fdlimit::raise_fd_limit();
+}
+*/
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub fn subscriber() -> impl tracing::Subscriber {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing_subscriber::registry().with(logger_layer())
+}
+
 /// A simple test logger that defaults to the INFO level
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub fn logger() {

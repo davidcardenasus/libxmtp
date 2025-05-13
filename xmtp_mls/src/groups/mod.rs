@@ -847,7 +847,7 @@ impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
                 current_cursor < welcome.id as i64
             };
             if !requires_processing {
-                return Err(ProcessIntentError::AlreadyProcessed(welcome.id).into());
+                return Err(ProcessIntentError::WelcomeAlreadyProcessed(welcome.id).into());
             }
 
             let mls_group = staged_welcome.into_group(provider)?;

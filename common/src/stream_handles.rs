@@ -1,5 +1,6 @@
 //! Consistent Stream behavior between WebAssembly and Native utilizing `tokio::task::spawn` in native and
 //! `wasm_bindgen_futures::spawn` for web.
+use tracing_futures::{Instrument, WithSubscriber};
 
 #[cfg(target_arch = "wasm32")]
 pub type GenericStreamHandle<O> = dyn StreamHandle<StreamOutput = O>;
@@ -291,6 +292,25 @@ mod native {
     {
         TokioStreamHandle {
             inner: tokio::task::spawn(future),
+            ready,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn spawn_instrumented<F>(
+        ready: Option<tokio::sync::oneshot::Receiver<()>>,
+        future: F,
+    ) -> impl StreamHandle<StreamOutput = F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        TokioStreamHandle {
+            inner: tokio::task::spawn(
+                future
+                    .instrument(tracing::info_span!("spawned_task"))
+                    .with_subscriber(crate::subscriber()),
+            ),
             ready,
         }
     }
